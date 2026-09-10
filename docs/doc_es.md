@@ -1,165 +1,227 @@
-# Documentación del Proyecto
+# Documentación del Proyecto EasyDocs
 
-## Descripción general de la API
-Servicio REST basado en Flask que permite generar documentación automática a partir de fragmentos de código fuente.  
-Soporta tres formatos de salida: **PDF**, **Markdown** y **DOCX**.  
-Incluye caché de resultados (hash de contenido + tipo + requisitos) para evitar llamadas redundantes a la IA.
+#### 1.1. Ratelimiter
+| Nombre | Responsabilidad | Funciones Clave / Lógica |
+| :--- | :--- | :--- |
+| `Ratelimiter` | Limitar el número de solicitudes por minuto (RPM) y tokens por minuto (TPM) | `__init__`, `allow_request` |
 
-Módulo Flask que expone dos rutas para trabajar con archivos **ZIP** que contienen código fuente.  
-- `POST /preview-zip` devuelve la lista de archivos contenidos.  
-- `POST /upload-zip` procesa el ZIP y genera documentación en **markdown**, **PDF** o **DOCX**.  
+#### 1.2. Redis
+| Nombre | Responsabilidad | Funciones Clave / Lógica |
+| :--- | :--- | :--- |
+| `redis` | Almacenar y recuperar datos en Redis | `ConnectionPool`, `Redis` |
 
-Se apoya en servicios de orquestación, chunking y caché para optimizar el procesamiento y reutilizar resultados.
+#### 1.3. Script LUA
+| Nombre | Responsabilidad | Funciones Clave / Lógica |
+| :--- | :--- | :--- |
+| `lua_script` | Verificar si se permiten los tokens solicitados y actualizar el estado de Redis | `redis.call` |
 
-El módulo **api.services.ai_services** expone la clase `DocumentadorIA`, que actúa como fachada para generar documentación técnica a partir de fragmentos de código fuente. Utiliza la API de Groq para invocar modelos de lenguaje (por defecto `llama-3.3-70b-versatile`) y un modelo secundario para aplicar ediciones adicionales.
+#### 2.1. Token Bucket
+* El algoritmo Token Bucket utiliza un "bucket" que se llena con tokens a un ritmo determinado (refill_rate).
+* El tamaño del "bucket" es determinado por el límite de tokens por minuto (max_capacity).
+* Cuando se solicita un token, se verifica si hay suficientes tokens en el "bucket". Si no hay suficientes, se espera hasta que el timeout expire.
 
-`ZipService` brinda funcionalidades para inspeccionar y manipular archivos ZIP que contienen código fuente. El foco principal es listar el contenido del ZIP, filtrar por extensiones permitidas y carpetas/archivos ignorados, y validar cada elemento.
+#### 2.2. Validaciones
+* Se verifica si el número de solicitudes por minuto (RPM) y tokens por minuto (TPM) están dentro de los límites establecidos.
+* Se verifica si el timeout ha expirado antes de permitir la solicitud.
 
-### Endpoints
+#### 3.1. Errores en Redis
+| Estado | Constante de Error | Razón/Condición |
+| :--- | :--- | :--- |
+| 500 | `redis_error` | Error al conectar a Redis o ejecutar la script LUA |
 
-#### `GET /download`
-- **Propósito**: Información estática sobre el punto de descarga.
-- **Respuesta** (`application/json`):
-  ```json
-  {
-    "message": "Documentation download endpoint",
-    "available_formats": ["pdf", "markdown", "docx"],
-    "usage": {
-      "pdf": {
-        "method": "POST",
-        "route": "/api/download/pdf",
-        "description": "Genera un PDF con la documentación del código recibido",
-        "body": {
-          "code": "Source code to document (required)",
-          "extra": "Additional requirements (optional)"
-        }
-      },
-      "markdown": { /* idem */ },
-      "docx": { /* idem */ }
-    },
-    "limits": {
-      "max_code_length": 50000,
-      "min_code_length": 10
-    }
-  }
-  ```
+#### 3.2. Errores en la Lógica Central
+| Estado | Constante de Error | Razón/Condición |
+| :--- | :--- | :--- |
+| 500 | `logic_error` | Error en la lógica central del Ratelimiter |
 
-#### `POST /download/<file_type>`
-- **`<file_type>`**: `pdf`, `markdown` o `docx`.  
-- **Cuerpo** (`application/json` o `multipart/form-data`):
-  - `code` **(string, obligatorio)** – fragmento de código fuente a documentar.  
-  - `extra` **(string, opcional)** – requisitos adicionales que la IA debe considerar.  
-- **Flujo interno**:
-  1. Validación del tipo de archivo.  
-  2. Extracción de datos mediante `get_request.get_request_data`.  
-  3. Validación de longitud mediante `validate.validar_codigo`.  
-  4. Generación de **cache key** con `cache.generate_hash`.  
-  5. Si la clave está en caché → se devuelve la documentación almacenada; de lo contrario, se invoca `DocumentadorIA.generar`.  
-  6. Según `file_type`, se delega a:
-     - `_generar_markdown`
-     - `_generar_pdf`
-     - `_generar_docx`
-- **Respuesta**: Archivo adjunto (`Content‑Disposition: attachment`) con nombre `documentacion_YYYY-MM-DD_HH-MM.<ext>`.
+#### 4.1. Crear un objeto Ratelimiter
+* Se debe proporcionar el número de solicitudes por minuto (RPM) y tokens por minuto (TPM) como parámetros.
+* Se debe proporcionar el prefijo para las llaves en Redis.
 
-**Ejemplo de petición (Python requests)**:
-```python
-import requests
+#### 4.2. Permitir una solicitud
+* Se debe llamar al método `allow_request` con el número de tokens solicitados como parámetro.
+* El método devolverá `True` si se permiten los tokens solicitados, o `False` si no se permiten.
 
-url = "http://localhost:5000/api/download/pdf"
-payload = {"code": "def foo(): pass", "extra": "incluye ejemplos"}
-r = requests.post(url, json=payload)
+#### 4.3. Configuración de Redis
+* Se debe configurar la URL de Redis en el entorno de ejecución.
+* Se debe configurar la conexión a Redis en el objeto Ratelimiter.
 
-with open("doc.pdf", "wb") as f:
-    f.write(r.content)
-```
+### 1. Componentes y Servicios
+| Nombre | Responsabilidad | Lógica Clave/Funciones |
+| --- | --- | --- |
+| `ChunkingService` | Dividir código en chunks manejables | `create_chunks`, `estimate_tokens` |
 
----
+#### 2.1. `create_chunks`
+*   Recibe una lista de archivos (`files`) y crea chunks de acuerdo a la configuración de tamaño máximo (`max_chunk_size`) y cantidad de archivos por chunk (`max_files_per_chunk`).
+*   Utiliza un bucle para iterar sobre los archivos y determinar si debe crear un nuevo chunk o agregar el archivo actual al chunk en curso.
+*   Si el chunk actual supera el tamaño máximo o la cantidad de archivos permitidos, se finaliza y se agrega a la lista de chunks.
+*   La función devuelve la lista de chunks finalizados.
 
-### Servicios internos
-| Servicio / Módulo | Responsabilidad | Funciones clave |
-|-------------------|-----------------|-----------------|
-| `DocumentadorIA` (services/ai_services) | Interfaz con modelo de IA que genera documentación en formato Markdown. | `generar(codigo, tipo="markdown", extra="")` |
-| `CacheService` (services/cache_service) | Caché en memoria (posible backend Redis). | `generate_hash(content, doc_type, extra_requirements)`, `get(key)`, `set(key, value)`, `get_stats()` |
-| `EasyDocsPDF` (export/pdf_gen) | Conversor de Markdown → PDF usando FPDF. | `add_page()`, `construir_desde_markdown(md)` |
-| `EasyDocsDOCX` (export/docx_gen) | Conversor de Markdown → DOCX usando python‑docx. | `agregar_encabezado()`, `construir_desde_markdown(md)`, `guardar(stream)` |
-| `validate` (utils) | Reglas de negocio sobre longitud y contenido del código. | `validar_codigo(codigo, logger, min_len, max_len)` |
-| `bytes_utils` (utils) | Preparación de objetos `BytesIO` para `send_file`. | `preparar_descarga(bytes_or_str)` |
-| `get_request` (utils) | Normaliza la extracción de datos de `request`. | `get_request_data(request)` |
+#### 2.2. `_finalize_chunk`
+*   Recibe los datos de un chunk en curso y calcula el contenido combinado de los archivos en el chunk.
+*   Utiliza un bucle para concatenar el contenido de cada archivo y agregar un encabezado con la información del archivo.
+*   Calcula el hash del contenido combinado y agrega la información del chunk a la lista de chunks.
 
----
+#### 2.3. `estimate_tokens`
+*   Recibe un texto y devuelve una estimación burda de tokens (aproximadamente 4 caracteres por token).
+*   Utiliza la función `len` para calcular la longitud del texto y divide por 4 para obtener la estimación de tokens.
 
-### Guía de integración
-1. **Instalar dependencias** (asumiendo `requirements.txt` incluye Flask, requests, etc.):
-   ```bash
-   pip install -r requirements.txt
-   ```
+### 3. Manejo de Errores y Excepciones
+| Estado | Constante de Error | Razón/Condición |
+| --- | --- | --- |
+|  |  | No hay archivos para crear chunks |
 
-2. **Registrar el Blueprint** en la aplicación Flask principal:
-   ```python
-   from flask import Flask
-   from api.routes.download import download_routes
+### 4. Guía de Integración / Uso
+*   Para utilizar el servicio de chunking, crea una instancia de `ChunkingService` y configura los parámetros de tamaño máximo y cantidad de archivos por chunk.
+*   Llama a la función `create_chunks` pasando la lista de archivos y la configuración deseada.
+*   La función devuelve la lista de chunks finalizados, que pueden ser procesados y almacenados según sea necesario.
 
-   app = Flask(__name__)
-   app.register_blueprint(download_routes, url_prefix="/api")
-   ```
+### 5. Reglas de Negocio
+*   Los chunks deben tener un tamaño máximo de `max_chunk_size` caracteres.
+*   Cada chunk debe contener un máximo de `max_files_per_chunk` archivos.
+*   La estimación de tokens debe ser aproximadamente 4 caracteres por token.
 
-3. **Consumir el endpoint** desde cualquier cliente HTTP.  
-   - **Headers recomendados**: `Content-Type: application/json` (o `multipart/form-data` si se envía archivo).  
-   - **Manejo de errores**: inspeccionar código de estado y campo `codigo_error` en la respuesta JSON.
+#### 1. Overview / Definición
+El `DocumentationOrchestrator` es un orquestador principal que coordina varias tareas para generar documentación a partir de archivos ZIP. Se encarga de la extracción de archivos, chunking, cache por hash, generación de documentación y consolidación de resultados.
 
-4. **Ejemplo completo (Node.js – fetch)**:
-   ```javascript
-   const payload = {
-     code: "function sum(a,b){return a+b;}",
-     extra: "añade tabla de ejemplos"
-   };
+El Documentador IA es un servicio que utiliza Inteligencia Artificial para generar documentación técnica a partir de código fuente. Se enfoca en analizar y explicar la lógica detrás del código, proporcionando una visión clara y concisa de la estructura y funcionalidad del sistema.
 
-   fetch('http://localhost:5000/api/download/markdown', {
-     method: 'POST',
-     headers: { 'Content-Type': 'application/json' },
-     body: JSON.stringify(payload)
-   })
-   .then(res => {
-     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-     return res.blob();
-   })
-   .then(blob => {
-     const url = window.URL.createObjectURL(blob);
-     const a = document.createElement('a');
-     a.href = url;
-     a.download = 'documentacion.md';
-     a.click();
-   })
-   .catch(console.error);
-   ```
+#### 2. Arquitectura de Componentes
+| Nombre | Responsabilidad | Lógica Clave/Funciones |
+| --- | --- | --- |
+| `ChunkingService` | Crear chunks de archivos | `create_chunks` |
+| `CacheService` | Manejar cache por hash | `get_stats` |
+| `DocumentadorIA` | Generar documentación | `detect_language` |
+| `Ratelimiter` | Limitar velocidad de procesamiento | (no implementado) |
 
----
+| Nombre | Responsabilidad | Lógica Clave / Funciones |
+| --- | --- | --- |
+| `DocumentadorIA` | Servicio principal que gestiona la generación de documentación | `__init__`, `generar`, `detect_language`, `build_system_prompt`, `build_user_prompt` |
+| `Ratelimiter` | Gestiona el límite de tokens para cada modelo | `allow_request` |
+| `get_groq_client` | Obtiene el cliente de Groq | - |
+| `get_prompts` | Obtiene las plantillas de promt | - |
+| `models` | Almacena la configuración de los modelos | - |
 
-### Códigos de error
-| Código HTTP | `codigo_error` | Condición | Mensaje devuelto |
-|-------------|----------------|-----------|------------------|
-| 400 | `INVALID_FILE_TYPE` | `file_type` no es `pdf`, `markdown` o `docx`. | `"Tipo de archivo no válido. Use 'pdf' , 'markdown' o 'docx"` |
-| 400 | `INVALID_CONTENT_TYPE` | El cuerpo de la petición no es JSON ni archivo. | `"El request debe ser JSON o contener un archivo"` |
-| 400 | `MISSING_FIELD` | Falta el campo `codigo` en el JSON. | `"El campo 'codigo' es requerido"` |
-| 400 | *validación personalizada* | `validate.validar_codigo` detecta longitud fuera de rango. | Contenido del diccionario devuelto por `validar_codigo`. |
-| 500 | `INTERNAL_SERVER_ERROR` | Excepción inesperada durante generación o envío. | `"Error interno del servidor al generar documentación <file_type>"` |
+#### 3. Lógica Central y Validaciones
+El `DocumentationOrchestrator` tiene varias lógicas clave:
 
----
+*   **Procesamiento de ZIP**: El método `process_zip` es el corazón del orquestador. Se encarga de procesar un ZIP y generar documentación consolidada.
+*   **Extracción de archivos**: El método `_extract_files` extrae archivos del ZIP usando el servicio existente.
+*   **Chunking**: El método `create_chunks` crea chunks de archivos utilizando el servicio de chunking.
+*   **Cache por hash**: El método `get_stats` devuelve estadísticas del cache.
+*   **Generación de documentación**: El método `detect_language` detecta el idioma del proyecto y el método `consolidate_documentation` consolida la documentación.
 
-## Servicios involucrados
-| Servicio | Responsabilidad |
-|----------|-----------------|
-| `ZipService` | Operaciones de inspección y extracción de contenido ZIP (`listar_contenido_zip`). |
-| `ChunkingService` | Divide el código en fragmentos manejables (máx. 8000 bytes, 10 archivos por chunk, estimación de 12 000 tokens). |
-| `CacheService` (obtenido vía `get_global_cache`) | Almacena resultados intermedios; configurado con capacidad 100 y política LRU. |
-| `DocumentationOrchestrator` | Orquesta el flujo completo: validación, chunking, caché y generación de documentación. |
-| `EasyDocsPDF` / `EasyDocsDOCX` | Convertidores de markdown a PDF y DOCX respectivamente. |
-| `bytes_utils.preparar_descarga` | Envuelve bytes en un objeto `io.BytesIO` listo para `send_file`. |
+Reglas de negocio:
 
----
+*   **Tamaño máximo de archivo**: El tamaño máximo de archivo es de 10 MB.
+*   **Número máximo de archivos**: El número máximo de archivos es de 50.
+*   **Idioma del proyecto**: El idioma del proyecto se detecta automáticamente o se puede forzar vía parámetros.
 
-## Endpoints (métodos públicos)
-| Método | Parámetros | Tipo de retorno | Descripción |
-|--------|------------|----------------|-------------|
-| `generar(codigo_fuente: str, tipo: str, extra: str = None, is_chunk: bool = False) -> str` | `codigo_fuente`: fragmento de código a documentar.<br>`tipo`: `'markdown'`, `'pdf'` o `'word'`.<br>`extra`: texto opcional con requisitos adicionales.<br>`is_chunk`: indica si el fragmento se procesa bajo modo *chunk*. | `str` con la documentación generada. | Orquesta la construcción de los prompts, la llamada a la API de Groq y la gestión de errores. |
-| `apply_extra(docs: str, extra: str = None) -> str` |
+El Documentador IA sigue un flujo de trabajo que incluye:
+
+1. **Deteción de idioma**: El servicio detecta el idioma del código fuente utilizando la función `detect_language`.
+2. **Generación de promt**: El servicio genera un promt para el modelo de IA utilizando la función `build_system_prompt` y `build_user_prompt`.
+3. **Gestión de límite de tokens**: El servicio verifica si el límite de tokens para el modelo se ha alcanzado utilizando la función `allow_request`.
+4. **Llamada a la API de IA**: El servicio llama a la API de IA para obtener la respuesta utilizando la función `generar`.
+5. **Limpieza de la respuesta**: El servicio limpia la respuesta de la API para eliminar etiquetas de razonamiento innecesarias.
+
+#### 4. Manejo de Errores y Excepciones
+| Estado | Constante de Error | Razón/Condición |
+| --- | --- | --- |
+| 400 | `ARCHIVO_DESALIMENTADO` | El archivo ZIP es demasiado grande. |
+| 400 | `NO_SE_ENCONTRARON_ARCHIVOS` | No se encontraron archivos válidos para documentar. |
+| 500 | `ERROR_DE_DETECCIÓN_DE_IDIOMA` | Error al detectar el idioma del proyecto. |
+
+| Estado | Constante de Error | Razón/Condición |
+| --- | --- | --- |
+| 400 | `NOMBRE_CODIGO_ERROR` | Error de detección de idioma |
+| 500 | `NOMBRE_CODIGO_ERROR` | Error de llamada a la API de IA |
+
+#### 5. Guía de Integración / Uso
+Para utilizar el `DocumentationOrchestrator`, debes proporcionar un ZIP y los parámetros necesarios. El orquestador se encargará de procesar el ZIP y generar documentación consolidada.
+
+**Parámetros**
+
+*   `zip_content`: Bytes del archivo ZIP.
+*   `doc_type`: Tipo de documento (markdown, pdf, word).
+*   `extra_requirements`: Requisitos adicionales.
+*   `zip_service`: Instancia de ZipService (inyectada para testing).
+*   `language`: Idioma del proyecto (opcional).
+
+**Respuesta**
+
+La respuesta del `DocumentationOrchestrator` es un diccionario que contiene la documentación consolidada, metadata y errores.
+
+Para utilizar el Documentador IA, simplemente proporciona el código fuente y el idioma deseado. El servicio se encargará de generar la documentación técnica correspondiente.
+
+**MODO FRAGMENTO ACTIVO**
+
+1. **PROHIBIDO**: No generes títulos de nivel 1 (#), introducciones, alcances ni índices.
+2. **ENFOQUE**: Comienza directamente con el análisis técnico de los archivos proporcionados.
+3. **JERARQUÍA**: Usa títulos de nivel
+
+#### 1. Componentes y Servicios
+| Nombre | Responsabilidad | Lógica Clave/Funciones |
+| --- | --- | --- |
+| `_parse_sections` | Procesar secciones de código fuente | `split`, `strip`, `try`-`except` |
+| `_process_chunks` | Procesar chunks de código fuente | `enumerate`, `logger.info`, `cache_service` |
+| `_consolidate_documentation` | Consolidar documentación de múltiples chunks | `defaultdict`, `re.split`, `re.sub` |
+
+#### 2. Lógica Central y Validaciones
+La lógica central del código se encuentra en la función `_parse_sections`, que procesa secciones de código fuente y extrae información relevante. La función `_process_chunks` se encarga de procesar chunks de código fuente y generar documentación.
+
+La lógica de validación se encuentra en la función `_parse_sections`, que utiliza `try`-`except` para manejar errores durante el procesamiento de secciones.
+
+#### 3. Manejo de Errores y Excepciones
+| Estado | Constante de Error | Razón/Condición |
+| --- | --- | --- |
+| Error | `logger.warning` | Error parseando sección |
+| Error | `logger.error` | Error procesando chunk |
+
+La función `_parse_sections` utiliza `logger.warning` para manejar errores durante el procesamiento de secciones. La función `_process_chunks` utiliza `logger.error` para manejar errores durante el procesamiento de chunks.
+
+#### 4. Guía de Integración / Uso
+Para integrar este código en un proyecto, es necesario:
+
+1. Importar las funciones `_parse_sections`, `_process_chunks` y `_consolidate_documentation`.
+2. Llamar a la función `_parse_sections` con un string de código fuente como argumento.
+3. Llamar a la función `_process_chunks` con un lista de chunks de código fuente como argumento.
+4. Llamar a la función `_consolidate_documentation` con una lista de resultados de procesamiento de chunks como argumento.
+
+### Reglas de Negocio
+* La función `_parse_sections` debe procesar secciones de código fuente y extraer información relevante.
+* La función `_process_chunks` debe procesar chunks de código fuente y generar documentación.
+* La función `_consolidate_documentation` debe consolidar documentación de múltiples chunks.
+
+### Observaciones
+* El código utiliza una estructura de datos `defaultdict` para almacenar secciones de código fuente.
+* El código utiliza una función `re.split` para separar secciones de código fuente.
+* El código utiliza una función `re.sub` para reemplazar contenido en secciones de código fuente.
+* El código utiliza una función `logger` para manejar errores y mensajes de log.
+
+### para cada componente o archivo analizado.
+4. **CONTINUIDAD**: Redacta el contenido como si fuera un capítulo intermedio de un libro técnico.
+5. **SÍNTESIS**: Si hay lógica repetida entre archivos del mismo fragmento, agrúpalos en una sola explicación.
+
+#### 2.1.1. Definición de Modelos
+El archivo `ai/models.py` define un conjunto de modelos de inteligencia artificial utilizando un formato de diccionario. Los modelos están identificados por sus nombres y tienen asociados un identificador (`id`) y un valor de tiempo de procesamiento por milla (`tpm`).
+
+#### 2.1.2. Componentes y Servicios
+| Nombre | Responsabilidad | Lógica Clave/Funciones |
+| :--- | :--- | :--- |
+| `chunking` | Modelo de procesamiento de texto | `id`: "llama-3.1-8b-instant", `tpm`: 14400 |
+| `final_doc` | Modelo de procesamiento de texto | `id`: "openai/gpt-oss-120b", `tpm`: 8000 |
+| `fallback` | Modelo de procesamiento de texto | `id`: "qwen/qwen3-32b", `tpm`: 6000 |
+| `emergency` | Modelo de procesamiento de texto | `id`: "openai/gpt-oss-20b", `tpm`: 8000 |
+
+#### 2.1.3. Manejo de Errores y Excepciones
+No hay errores o excepciones definidos en este archivo.
+
+#### 2.1.4. Guía de Integración / Uso
+Para integrar estos modelos en una aplicación, se debe acceder a los valores de `id` y `tpm` para cada modelo. La elección del modelo depende del contexto de la aplicación y de las necesidades de procesamiento de texto.
+
+### 2.2. Observaciones
+* Los modelos están definidos como un conjunto de diccionarios, lo que permite una fácil lectura y modificación de los valores.
+* La elección del modelo depende del contexto de la aplicación y de las necesidades de procesamiento de texto.
+* No hay errores o excepciones definidos en este archivo.
+
